@@ -1,1 +1,1 @@
-# life
+Discontinued project
