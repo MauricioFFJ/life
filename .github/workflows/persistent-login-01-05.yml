@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false # Evita execução simultânea; nova espera a anterior terminar
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
