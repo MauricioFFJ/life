@@ -11,14 +11,14 @@ from datetime import datetime, timezone
 
 from selenium import webdriver
 from selenium.common.exceptions import (
-    NoSuchElementException, TimeoutException,
+    NoSuchElementException, TimeoutException, StaleElementReferenceException,
     ElementClickInterceptedException, ElementNotInteractableException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from colorama import Fore, Style, init
@@ -864,9 +864,6 @@ class VisitaIndeterminada(Exception):
 def visitar_quarto(driver, account_id, dados, comando_id):
     """Navega pela busca de dono e escolhe a sala mais próxima do nome pedido.
 
-    O DOM é manipulado em UMA chamada assíncrona ao navegador para evitar
-    múltiplos round-trips lentos do WebDriver. Não há repetição automática,
-    pois um clique de entrada pode ter ocorrido antes de um timeout.
     """
     if not isinstance(dados, dict):
         raise ValueError("VISITAR QUARTO recebeu um payload inválido.")
@@ -882,12 +879,49 @@ def visitar_quarto(driver, account_id, dados, comando_id):
         status="🚪 VISITAR QUARTO",
     )
     inicio = time.monotonic()
+    espera = WebDriverWait(driver, 12, ignored_exceptions=(StaleElementReferenceException,))
+    seletor_filtro = (By.XPATH, "//select[option[@value='2' and normalize-space(.)='Dono']]")
+    seletor_campo = (By.CSS_SELECTOR, 'input.form-control.form-control-sm[placeholder="filtrar quartos por"]')
+
+    def filtro_visivel(navegador):
+        return next((el for el in navegador.find_elements(*seletor_filtro)
+                     if el.is_displayed() and el.is_enabled()), None)
+
+    def preparar_busca(navegador):
+        filtro = filtro_visivel(navegador)
+        if filtro is None:
+            return False
+        if filtro.get_property("value") != "2":
+            Select(filtro).select_by_value("2")
+            return False  # Aguarda o formulário atualizado pelo cliente.
+        janela = navegador.execute_script("return arguments[0].closest('.nitro-card') || document.documentElement", filtro)
+        campo = next((el for el in janela.find_elements(*seletor_campo)
+                      if el.is_displayed() and el.is_enabled()), None)
+        if campo is None:
+            return False
+        if campo.get_property("value") != dono:
+            campo.click()
+            campo.send_keys(Keys.CONTROL, "a")
+            campo.send_keys(Keys.BACKSPACE)
+            campo.send_keys(dono)
+            return False
+        return campo
+
+    if not filtro_visivel(driver):
+        espera.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, ".navigation-item.icon.icon-rooms")
+        )).click()
+    try:
+        campo = espera.until(preparar_busca)
+    except TimeoutException as erro:
+        raise RuntimeError("VISITAR QUARTO: não foi possível confirmar o filtro Dono e o nome digitado.") from erro
     try:
         driver.set_script_timeout(VISITAR_QUARTO_SCRIPT_TIMEOUT)
         resposta = driver.execute_async_script(
             VISITAR_QUARTO_JS,
             dono,
             quarto,
+            campo,
             (VISITAR_QUARTO_SCRIPT_TIMEOUT - 5) * 1000,
         )
     except Exception as erro:
@@ -955,7 +989,9 @@ VISITAR_QUARTO_JS = r"""
 // de formulários controlados por React. A navegação real depende do Habblive.
 const dono = String(arguments[0] || '').trim();
 const quartoDesejado = String(arguments[1] || '').trim();
-const limiteMs = Number(arguments[2]) || 50000;
+const limiteMs = Number(arguments[3]) || 50000;
+const campo = arguments[2];
+const painel = campo.closest('.nitro-card') || document;
 const finalizarSelenium = arguments[arguments.length - 1];
 const inicio = performance.now();
 const trilha = [];
@@ -988,10 +1024,6 @@ function visivel(el) {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
 }
-function todos(seletor) {
-    return Array.from(document.querySelectorAll(seletor)).filter(visivel);
-}
-function primeiro(seletor) { return todos(seletor)[0] || null; }
 function dormir(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function restante() { return limiteMs - (performance.now() - inicio); }
 async function esperar(fn, prazoMs, intervalo = 150) {
@@ -1009,38 +1041,20 @@ function clicar(el, descricao) {
     el.click();
     trilha.push('Clique: ' + descricao);
 }
-function selecionarDono() {
-    return todos('select.form-select.form-select-sm').find(el =>
-        Array.from(el.options || []).some(o =>
-            o.value === '2' && normalizar(o.textContent) === 'dono')) || null;
-}
-function campoBusca() {
-    return primeiro('input.form-control.form-control-sm[placeholder="filtrar quartos por"]') ||
-        primeiro('input[placeholder="filtrar quartos por"]');
-}
-function preencherInput(input, valor) {
-    if (!visivel(input) || input.disabled || input.readOnly) {
-        throw new Error('Campo de pesquisa do dono indisponível.');
+function botaoBuscar() {
+    const seletor = 'div.d-flex.align-items-center.justify-content-center.btn.btn-primary.btn-sm.btn-darkblue';
+    for (let pai = campo.parentElement; pai; pai = pai.parentElement) {
+        const botoes = [...pai.querySelectorAll(seletor)].filter(visivel);
+        const rotulado = botoes.find(el => normalizar(texto(el)) === 'buscar');
+        if (rotulado) return rotulado;
+        if (botoes.length === 1 && !texto(botoes[0])) return botoes[0];
+        if (pai === painel) break;
     }
-    input.focus({preventScroll: true});
-    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-    setValue.call(input, valor);
-    try {
-        input.dispatchEvent(new InputEvent('input', {
-            bubbles: true, composed: true, data: valor, inputType: 'insertText'
-        }));
-    } catch (_) { input.dispatchEvent(new Event('input', {bubbles: true})); }
-    input.dispatchEvent(new Event('change', {bubbles: true}));
-}
-function alterarSelect(select, valor) {
-    const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-    setValue.call(select, valor);
-    select.dispatchEvent(new Event('input', {bubbles: true}));
-    select.dispatchEvent(new Event('change', {bubbles: true}));
+    return null;
 }
 function nomesQuartos() {
-    return todos('div.flex-grow-1.d-inline.text-black.text-truncate')
-        .map(el => ({el, nome: texto(el)})).filter(x => x.nome.length > 0);
+    return [...painel.querySelectorAll('div.flex-grow-1.d-inline.text-black.text-truncate')]
+        .filter(visivel).map(el => ({el, nome: texto(el)})).filter(x => x.nome);
 }
 function similaridadeEdicao(a, b) {
     if (a === b) return 1;
@@ -1089,66 +1103,29 @@ function decidir(ordenados) {
 (async () => {
     try {
         if (!dono || !quartoDesejado) throw new Error('Dono/quarto vazios.');
-        fase = 'abrindo navegador de quartos';
-        let filtro = selecionarDono();
-        let busca = campoBusca();
-        // Se navegador já está aberto, não clicar no ícone: ele pode fechar a janela.
-        if (!filtro || !busca) {
-            const rooms = await esperar(() => primeiro('div.cursor-pointer.navigation-item.icon.icon-rooms'), 6500);
-            if (!rooms) throw new Error('Ícone icon-rooms não encontrado.');
-            clicar(rooms, 'navegador de quartos');
-        }
-
-        fase = 'selecionando filtro Dono';
-        filtro = await esperar(selecionarDono, 9000);
-        if (!filtro) throw new Error('Select do navegador com opção Dono (value=2) não apareceu.');
-        alterarSelect(filtro, '2');
-        await dormir(170);
-        if (filtro.isConnected && filtro.value !== '2') {
-            throw new Error('Filtro Dono não permaneceu selecionado.');
-        }
-        trilha.push('Filtro Dono (value=2) selecionado');
-
-        fase = 'preenchendo nome do dono';
-        busca = await esperar(campoBusca, 5000);
-        if (!busca) throw new Error('Campo filtrar quartos por não apareceu.');
-        preencherInput(busca, dono);
-        await dormir(230);
-        if (busca.isConnected && busca.value !== dono) {
-            throw new Error('O campo não manteve o nome do dono (interface controlada).');
-        }
-        trilha.push('Dono pesquisado: ' + dono);
-
         fase = 'clicando botão de buscar';
-        const antes = nomesQuartos().map(x => x.nome).join('\u241f');
-        const contenedor = busca.closest('div.d-flex.w-100.gap-1') || busca.parentElement;
-        const botao = contenedor?.querySelector('.btn.btn-primary.btn-sm.btn-darkblue');
-        if (!botao || !visivel(botao)) {
-            throw new Error('Botão de pesquisa ao lado do campo não encontrado.');
-        }
+        if (!visivel(campo) || campo.value !== dono) throw new Error('O campo do dono mudou antes da busca.');
+        const botao = await esperar(botaoBuscar, 5000);
+        if (!botao) throw new Error('Botão Buscar não encontrado no navegador de quartos.');
+        const antes = nomesQuartos();
         clicar(botao, 'pesquisar quartos por dono');
 
         fase = 'aguardando lista filtrada de quartos';
         // O botão dispara uma consulta. Não escolher linhas antigas enquanto
         // o React ainda está atualizando o resultado da pesquisa.
-        await dormir(700);
-        let ranking = [];
-        const buscaIniciada = performance.now();
-        const fim = performance.now() + Math.min(11000, Math.max(0, restante() - 1200));
-        while (performance.now() < fim) {
-            ranking = classificacao();
-            const depois = ranking.map(x => x.nome).join('\u241f');
-            const mudaramResultados = (depois !== antes);
-            const decorridoBusca = performance.now() - buscaIniciada;
-            const decisao = decidir(ranking);
-            // Se resultados permaneceram idênticos, aguarda um pouco mais
-            // para não clicar em um resultado possivelmente desatualizado.
-            if (decisao.tipo !== 'ausente' && (mudaramResultados || decorridoBusca > 2200)) {
-                break;
-            }
-            await dormir(220);
+        let mudou = false;
+        const lista = await esperar(() => {
+            const atual = nomesQuartos();
+            mudou ||= atual.length !== antes.length || atual.some((x, i) =>
+                x.el !== antes[i]?.el || x.nome !== antes[i]?.nome);
+            return mudou && atual.length ? atual : null;
+        }, 15000);
+        if (!lista) {
+            finalizar('quarto_ausente', {candidatos: [], trilha: [...trilha,
+                'A busca não apresentou uma lista nova de quartos.']});
+            return;
         }
-        ranking = classificacao();
+        const ranking = classificacao();
         const resumo = ranking.slice(0, 5).map(x => ({
             nome: x.nome, pontuacao: Number(x.pontuacao.toFixed(3))
         }));
