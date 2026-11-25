@@ -1609,28 +1609,22 @@ def clicar_icone_com_seguranca(driver, elemento, descricao):
         ) from erro
 
 
-def ir_ao_cafofo(driver, account_id, comando_id):
-    """Abre o CAFOFO via DOM JavaScript em UMA chamada ao navegador.
-
-    Se houver casa visível, clica diretamente. Senão, clica no ícone Habbo,
-    aguarda a casa ficar visível e então clica nela. O resultado informa
-    o que foi realmente executado no DOM, não garante a navegação no servidor.
-
-    Não usa WebElement.click/is_displayed/WebDriverWait: chamadas desse tipo
-    ficaram bloqueadas por muito tempo nos logs do usuário.
-    """
+def navegar_para_destino(driver, account_id, comando_id, destino):
+    """Executa a sequência de navegação correspondente ao destino da conta."""
+    if destino not in ("Cafofo", "Vista do hotel"):
+        raise ValueError(f"Destino inválido: {destino!r}")
     inicio = time.monotonic()
     marcar_etapa(
         account_id,
-        "CAFOFO: executando casa direta ou Habbo → casa via JavaScript...",
-        status="🏠 CAFOFO",
+        f"{destino}: iniciando navegação...",
+        status=destino,
     )
 
     # O timeout padrão de script assíncrono do Selenium é 30s.
     # Limitamos a espera dentro da página para não ultrapassar esse padrão.
     espera_ms = max(2000, min(CAFOFO_HOUSE_TIMEOUT * 1000, 18000))
     script = r"""
-        const esperaMs = arguments[0];
+        const [esperaMs, destino] = arguments;
         const concluir = arguments[arguments.length - 1];
         const seletorCasa = 'div.cursor-pointer.navigation-item.icon.icon-house';
         const seletorHabbo = 'div.cursor-pointer.navigation-item.icon.icon-habbo';
@@ -1678,41 +1672,32 @@ def ir_ao_cafofo(driver, account_id, comando_id):
         }
 
         try {
-            const casaDireta = acharVisivel(seletorCasa);
-            if (casaDireta) {
-                fase = 'clicando casa diretamente';
-                casaDireta.click();
-                finalizar('casa_direta');
-                return;
-            }
-
-            fase = 'procurando menu Habbo';
+            fase = 'procurando ícone Habbo';
             const habbo = acharVisivel(seletorHabbo);
-            if (!habbo) {
-                finalizar('menu_ausente', {
-                    motivo: 'Nem a casa nem o ícone Habbo estão visíveis neste documento.'
-                });
+            if (habbo) {
+                fase = 'clicando ícone Habbo';
+                habbo.click();
+                menuClicado = true;
+            }
+            if (destino === 'Vista do hotel') {
+                finalizar(habbo ? 'vista_clicada' : 'habbo_ausente');
                 return;
             }
-
-            fase = 'clicando menu Habbo';
-            habbo.click();
-            menuClicado = true;
-            fase = 'aguardando casa após menu Habbo';
+            fase = 'procurando casa';
 
             function tentarCasa() {
                 if (concluido) return;
                 try {
                     const casa = acharVisivel(seletorCasa);
                     if (casa) {
-                        fase = 'clicando casa após Habbo';
+                        fase = 'clicando casa';
                         casa.click();
-                        finalizar('menu_e_casa');
+                        finalizar(menuClicado ? 'menu_e_casa' : 'casa_direta');
                         return;
                     }
                     if (performance.now() - inicio >= esperaMs) {
                         finalizar('casa_nao_apareceu', {
-                            motivo: 'O menu Habbo recebeu um click, mas a casa não apareceu a tempo.'
+                            motivo: 'O ícone da casa não apareceu a tempo.'
                         });
                         return;
                     }
@@ -1721,25 +1706,26 @@ def ir_ao_cafofo(driver, account_id, comando_id):
                     finalizar('erro_js', {motivo: String(erro)});
                 }
             }
-            setTimeout(tentarCasa, 120);
+            if (menuClicado) setTimeout(tentarCasa, 120);
+            else tentarCasa();
         } catch (erro) {
             finalizar('erro_js', {motivo: String(erro)});
         }
     """
 
     try:
-        resposta = driver.execute_async_script(script, espera_ms)
+        resposta = driver.execute_async_script(script, espera_ms, destino)
     except Exception as erro:
         # Uma resposta perdida pode significar que o clique já foi executado.
         # Não repetimos automaticamente para não reabrir/fechar o menu.
         raise CliqueIndeterminado(
-            f"CAFOFO {comando_id}: ChromeDriver não confirmou a execução JS "
+            f"{destino} {comando_id}: ChromeDriver não confirmou a execução JS "
             f"({type(erro).__name__}: {str(erro)[:220]})."
         ) from erro
 
     if not isinstance(resposta, dict):
         raise CliqueIndeterminado(
-            f"CAFOFO {comando_id}: resposta inesperada do navegador: {resposta!r}"
+            f"{destino} {comando_id}: resposta inesperada do navegador: {resposta!r}"
         )
 
     estado = resposta.get('estado')
@@ -1754,23 +1740,22 @@ def ir_ao_cafofo(driver, account_id, comando_id):
             f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: menu Habbo → "
             f"casa clicada via JavaScript em {tempo:.1f}s.", Fore.GREEN
         )
-    elif estado == 'menu_ausente':
-        raise RuntimeError(
-            f"CAFOFO {comando_id}: casa e menu Habbo ausentes/ocultos. "
-            "Verifique a interface do cliente."
-        )
+    elif estado == 'vista_clicada':
+        log(f"[Conta {account_id}] Vista do hotel: ícone Habbo clicado.", Fore.GREEN)
+    elif estado == 'habbo_ausente':
+        log(f"[Conta {account_id}] Vista do hotel: ícone Habbo ausente, sem clique.", Fore.GREEN)
     else:
         # Se o menu foi acionado, repetir o comando pode fechá-lo novamente.
         erro = resposta.get('motivo', 'Resultado não confirmado.')
         if resposta.get('menuClicado') or estado == 'erro_js':
             raise CliqueIndeterminado(
-                f"CAFOFO {comando_id}: estado={estado}; fase={resposta.get('fase')}; "
+                f"{destino} {comando_id}: estado={estado}; fase={resposta.get('fase')}; "
                 f"detalhes={erro}. Sem repetição automática."
             )
-        raise RuntimeError(f"CAFOFO {comando_id}: estado={estado}; {erro}")
+        raise RuntimeError(f"{destino} {comando_id}: estado={estado}; {erro}")
 
     marcar_etapa(
-        account_id, "CAFOFO: ação de clique concluída via JavaScript.",
+        account_id, f"{destino}: comando concluído.",
         Fore.GREEN, status="✅ Online", registrar=False
     )
 
@@ -1791,8 +1776,8 @@ def processar_comando_da_fila(driver, account_id):
         fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
-    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
-    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO", "treat_pets": "🌿 TRATAR E CARINHOS"}.get(acao, "🔄 Executando")
+    nome_acao = {"say": "FALAR", "go_home": mensagem, "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
+    status_acao = {"say": "💬 FALAR", "go_home": mensagem, "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO", "treat_pets": "🌿 TRATAR E CARINHOS"}.get(acao, "🔄 Executando")
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
@@ -1811,7 +1796,7 @@ def processar_comando_da_fila(driver, account_id):
         if acao == "say":
             enviar_mensagem(driver, account_id, mensagem, comando_id)
         elif acao == "go_home":
-            ir_ao_cafofo(driver, account_id, comando_id)
+            navegar_para_destino(driver, account_id, comando_id, mensagem)
         elif acao == "respect":
             respeitar_usuario(driver, account_id, mensagem, comando_id)
         elif acao == "visit_room":
@@ -1832,7 +1817,7 @@ def processar_comando_da_fila(driver, account_id):
             )
         elif acao == "go_home":
             log(
-                f"[Conta {account_id}] ✅ CAFOFO {comando_id}: clique realizado "
+                f"[Conta {account_id}] ✅ {mensagem} {comando_id}: comando concluído "
                 "(navegação final não confirmada).",
                 Fore.GREEN,
             )
@@ -1959,6 +1944,11 @@ def monitorar_comandos(account_ids):
 
                     if acao == "say":
                         mensagem = str(comando.get("message", ""))
+                    elif acao == "go_home":
+                        mensagem = comando.get("destino", "Cafofo")
+                        if mensagem not in ("Cafofo", "Vista do hotel"):
+                            log(f"Destino inválido em {nome}: {mensagem!r}", Fore.YELLOW)
+                            continue
                     elif acao == "respect":
                         mensagem = str(comando.get("target_name", "")).strip()
                     elif acao == "visit_room":
@@ -2022,7 +2012,7 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO', 'treat_pets': 'TRATAR E CARINHOS'}[acao] } recebido "
+                        f"Novo comando { {'say': 'FALAR', 'go_home': mensagem, 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO', 'treat_pets': 'TRATAR E CARINHOS'}[acao] } recebido "
                         f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )
