@@ -62,6 +62,7 @@ status_contas = {}
 lock = threading.Lock()
 drivers_ativos = {}  # Mantido para status/compatibilidade; o monitor não usa Selenium.
 filas_comandos = {}  # Uma fila independente por conta.
+fila_confirmacoes = queue.Queue()
 comandos_concluidos = {}  # IDs concluídos por conta.
 ultima_atividade = {}  # Momento da última etapa concluída/iniciada por conta.
 etapa_atividade = {}  # Etapa Selenium em andamento para localizar travamentos.
@@ -1842,13 +1843,13 @@ def processar_comando_da_fila(driver, account_id):
         return
 
     try:
-        comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos = fila.get_nowait()
+        comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos, recibo = fila.get_nowait()
     except queue.Empty:
         return
 
     agora = time.time()
     if agora < executar_apos:
-        fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
+        fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos, recibo))
         return
 
     nome_acao = {"say": "FALAR", "go_home": mensagem, "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "change_outfit": "TROCAR ROUPA", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
@@ -1885,6 +1886,7 @@ def processar_comando_da_fila(driver, account_id):
 
         with lock:
             comandos_concluidos.setdefault(comando_id, set()).add(account_id)
+        fila_confirmacoes.put((*recibo, account_id))
 
         if acao == "say":
             log(
@@ -1951,7 +1953,7 @@ def processar_comando_da_fila(driver, account_id):
         if tentativa_atual < max_tentativas and idade < COMMAND_MAX_AGE_SECONDS:
             proxima = time.time() + COMMAND_RETRY_DELAY_SECONDS
             fila.put((comando_id, acao, mensagem, criado_timestamp,
-                      tentativa_atual, proxima))
+                      tentativa_atual, proxima, recibo))
             log(
                 f"[Conta {account_id}] {nome_acao} {comando_id}: nova tentativa "
                 f"daqui a {COMMAND_RETRY_DELAY_SECONDS}s ",
@@ -1969,6 +1971,63 @@ def processar_comando_da_fila(driver, account_id):
         )
 
 
+def registrar_confirmacoes(caminho, original, contas):
+    """Une confirmações de diferentes grupos e protege a escrita com o SHA atual."""
+    arquivo, _, _ = github_api_request(caminho)
+    if arquivo is None:
+        return
+    comando = json.loads(base64.b64decode(arquivo["content"]))
+    confirmadas = set(comando.pop("completed_targets", []))
+    if comando != original:
+        log(f"Limpeza ignorada: conteúdo de {caminho} foi substituído.", Fore.YELLOW)
+        return
+    alvos = {int(n) for n in comando["targets"]}
+    total = confirmadas | (contas & alvos)
+    apagar = bool(alvos) and alvos <= total
+    if not apagar and total == confirmadas:
+        return
+    dados = {"sha": arquivo["sha"], "branch": GITHUB_REF_NAME,
+             "message": f"Fila: {'concluir' if apagar else 'confirmar'} {caminho}"}
+    if not apagar:
+        comando["completed_targets"] = sorted(total)
+        dados["content"] = base64.b64encode(json.dumps(comando, ensure_ascii=False).encode()).decode()
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{quote(caminho, safe='/')}"
+    pedido = urllib.request.Request(url, method="DELETE" if apagar else "PUT",
+        data=json.dumps(dados).encode(), headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json", "User-Agent": "Habblive-Persistent-Login",
+        })
+    with urllib.request.urlopen(pedido, timeout=20):
+        pass
+    if apagar:
+        log(f"Fila: {caminho} removido após confirmação de todas as contas.", Fore.GREEN)
+
+
+def sincronizar_confirmacoes():
+    pendentes = {}
+    while True:
+        while True:
+            try:
+                caminho, original, conta = fila_confirmacoes.get_nowait()
+            except queue.Empty:
+                break
+            item = pendentes.setdefault(caminho, {"original": original, "contas": set(), "falhas": 0, "apos": 0})
+            item["contas"].add(conta)
+        for caminho, item in list(pendentes.items()):
+            if time.monotonic() < item["apos"]:
+                continue
+            try:
+                registrar_confirmacoes(caminho, item["original"], item["contas"])
+            except Exception as erro:
+                item["falhas"] += 1
+                atraso = min(300, 2 ** min(item["falhas"], 9))
+                item["apos"] = time.monotonic() + atraso
+                log(f"Confirmação pendente de {caminho}: {erro!r}. Nova consulta em {atraso}s.", Fore.YELLOW)
+            else:
+                del pendentes[caminho]
+        time.sleep(2)
+
+
 def monitorar_comandos(account_ids):
     """Busca comandos no GitHub e os distribui; nunca acessa objetos Selenium."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
@@ -1978,6 +2037,7 @@ def monitorar_comandos(account_ids):
         )
         return
 
+    threading.Thread(target=sincronizar_confirmacoes, daemon=True).start()
     conhecidos = set()
     etag = None
     try:
@@ -2041,7 +2101,8 @@ def monitorar_comandos(account_ids):
                     else:
                         mensagem = ""
                     alvos = set(int(item) for item in comando.get("targets", []))
-                    alvos_locais = alvos.intersection(account_ids_set)
+                    ja_confirmadas = set(comando.pop("completed_targets", []))
+                    alvos_locais = alvos.intersection(account_ids_set) - ja_confirmadas
 
                     if not alvos_locais:
                         continue
@@ -2087,6 +2148,7 @@ def monitorar_comandos(account_ids):
                         "action": acao,
                         "message": mensagem,
                         "targets": alvos_locais,
+                        "recibo": (caminho, comando),
                         "dispatched": set(),
                         "created_at": criado_em,
                     }
@@ -2133,6 +2195,7 @@ def monitorar_comandos(account_ids):
                         item["created_at"].timestamp(),
                         0,
                         0.0,  # disponível para execução imediata
+                        item["recibo"],
                     ))
                     item["dispatched"].add(account_id)
                     log(
@@ -2145,7 +2208,7 @@ def monitorar_comandos(account_ids):
 
                 if item["targets"].issubset(concluidas):
                     log(
-                        f"Comando {comando_id} concluído para todas as contas selecionadas.",
+                        f"Comando {comando_id} concluído nas contas locais.",
                         Fore.GREEN
                     )
                     pendentes.pop(comando_id, None)
