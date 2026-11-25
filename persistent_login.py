@@ -897,14 +897,6 @@ def visitar_quarto(driver, account_id, dados, comando_id):
         janela = navegador.execute_script("return arguments[0].closest('.nitro-card') || document.documentElement", filtro)
         campo = next((el for el in janela.find_elements(*seletor_campo)
                       if el.is_displayed() and el.is_enabled()), None)
-        if campo is None:
-            return False
-        if campo.get_property("value") != dono:
-            campo.click()
-            campo.send_keys(Keys.CONTROL, "a")
-            campo.send_keys(Keys.BACKSPACE)
-            campo.send_keys(dono)
-            return False
         return campo
 
     if not filtro_visivel(driver):
@@ -914,7 +906,7 @@ def visitar_quarto(driver, account_id, dados, comando_id):
     try:
         campo = espera.until(preparar_busca)
     except TimeoutException as erro:
-        raise RuntimeError("VISITAR QUARTO: não foi possível confirmar o filtro Dono e o nome digitado.") from erro
+        raise RuntimeError("VISITAR QUARTO: não foi possível localizar o filtro Dono e o campo de busca.") from erro
     try:
         driver.set_script_timeout(VISITAR_QUARTO_SCRIPT_TIMEOUT)
         resposta = driver.execute_async_script(
@@ -990,8 +982,8 @@ VISITAR_QUARTO_JS = r"""
 const dono = String(arguments[0] || '').trim();
 const quartoDesejado = String(arguments[1] || '').trim();
 const limiteMs = Number(arguments[3]) || 50000;
-const campo = arguments[2];
-const painel = campo.closest('.nitro-card') || document;
+let campo = arguments[2];
+let painel = campo.closest('.nitro-card') || document;
 const finalizarSelenium = arguments[arguments.length - 1];
 const inicio = performance.now();
 const trilha = [];
@@ -1103,10 +1095,36 @@ function decidir(ordenados) {
 (async () => {
     try {
         if (!dono || !quartoDesejado) throw new Error('Dono/quarto vazios.');
+        fase = 'confirmando nome completo do dono';
+        const seletorCampo = 'input.form-control.form-control-sm[placeholder="filtrar quartos por"]';
+        let estavelDesde = null;
+        const botao = await esperar(() => {
+            if (!painel.isConnected && painel !== document) {
+                const filtro = [...document.querySelectorAll('select.form-select.form-select-sm')]
+                    .find(el => visivel(el) && el.value === '2' &&
+                        [...el.options].some(o => o.value === '2' && normalizar(texto(o)) === 'dono'));
+                if (!filtro) { estavelDesde = null; return null; }
+                painel = filtro.closest('.nitro-card') || document;
+            }
+            const atual = [...painel.querySelectorAll(seletorCampo)].find(visivel);
+            if (!atual || atual.disabled || atual.readOnly) { estavelDesde = null; return null; }
+            if (atual !== campo) { campo = atual; estavelDesde = null; }
+            if (campo.value !== dono || estavelDesde === null) {
+                campo.focus();
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                setter.call(campo, dono);
+                campo.dispatchEvent(new Event('input', {bubbles: true}));
+                campo.dispatchEvent(new Event('change', {bubbles: true}));
+                estavelDesde = performance.now();
+                return null;
+            }
+            return performance.now() - estavelDesde >= 1500 && botaoBuscar();
+        }, 10000);
+        if (!botao || !visivel(campo) || campo.value !== dono) {
+            throw new Error('O nome completo do dono não estabilizou ou o botão Buscar não apareceu.');
+        }
+        trilha.push('Nome confirmado antes de Buscar: ' + campo.value);
         fase = 'clicando botão de buscar';
-        if (!visivel(campo) || campo.value !== dono) throw new Error('O campo do dono mudou antes da busca.');
-        const botao = await esperar(botaoBuscar, 5000);
-        if (!botao) throw new Error('Botão Buscar não encontrado no navegador de quartos.');
         const antes = nomesQuartos();
         clicar(botao, 'pesquisar quartos por dono');
 
