@@ -1770,70 +1770,75 @@ def navegar_para_destino(driver, account_id, comando_id, destino):
 
 
 TROCAR_ROUPA_JS = r"""
-const posicao = arguments[0];
-const concluir = arguments[arguments.length - 1];
-const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
-const visivel = el => el && el.getClientRects().length && el.checkVisibility({visibilityProperty: true});
-function encontrar(seletor, raiz = document, nome = null) {
+const [etapa, posicao] = arguments;
+const visivel = el => el.getClientRects().length && el.checkVisibility({visibilityProperty: true});
+const ativo = el => !el.matches(':disabled, .disabled, [aria-disabled="true"]');
+function achar(seletor, raiz = document, texto = null) {
     return [...raiz.querySelectorAll(seletor)].find(el =>
-        visivel(el) && !el.matches(':disabled, .disabled, [aria-disabled="true"]') &&
-        (nome === null || el.textContent.trim() === nome));
+        visivel(el) && ativo(el) && (texto === null || el.textContent.trim() === texto));
 }
-async function aguardar(buscar, descricao) {
-    const fim = performance.now() + 7000;
-    do {
-        const el = buscar();
-        if (el) return el;
-        await pausa(200);
-    } while (performance.now() < fim);
-    throw new Error(descricao);
-}
-async function clicar(buscar, descricao) {
-    const el = await aguardar(buscar, descricao);
-    el.click();
-    await pausa(1200);
-}
-const roupas = () => encontrar('.navigation-item.icon-me-clothing');
-const aba = () => encontrar('.main-wardrobe-icon')?.closest('.nav-item');
-const cartao = '.nitro-avatar-editor-wardrobe-figure-preview';
-function grade() {
-    return encontrar(cartao)?.parentElement;
-}
-(async () => {
-    try {
-        if (!aba()) {
-            if (!roupas()) {
-                await clicar(() => encontrar('.navigation-item.item-avatar'), 'Avatar indisponível.');
-            }
-            await clicar(roupas, 'Menu de roupas indisponível.');
+const seletor = '.nitro-avatar-editor-wardrobe-figure-preview';
+const primeiro = achar(seletor);
+const grade = primeiro?.parentElement;
+const aba = achar('.main-wardrobe-icon')?.closest('.nav-item');
+let alvo;
+let detalhe;
+switch (etapa) {
+    case 'avatar':
+        if (aba || grade || achar('.navigation-item.icon-me-clothing')) return {pronto: true};
+        alvo = achar('.navigation-item.item-avatar');
+        break;
+    case 'roupas':
+        if (aba || grade) return {pronto: true};
+        alvo = achar('.navigation-item.icon-me-clothing');
+        break;
+    case 'guarda-roupa':
+        if (grade) return {pronto: true};
+        alvo = aba;
+        break;
+    case 'Usar': {
+        const cartoes = grade ? [...grade.querySelectorAll(seletor)] : [];
+        const item = cartoes[posicao - 1];
+        if (item && visivel(item)) {
+            item.scrollIntoView({block: 'nearest', inline: 'nearest'});
+            // O cliente pode ocultar a faixa de botões até o ponteiro passar pelo cartão.
+            const botoes = [...item.querySelectorAll('.button-container .btn')];
+            alvo = botoes.find(el => ativo(el) && el.textContent.trim() === 'Usar');
+            detalhe = 'botões na posição ' + posicao + ': ' +
+                (botoes.map(el => el.textContent.trim()).join(', ') || 'nenhum');
+        } else {
+            detalhe = cartoes.length + ' posições encontradas; posição ' + posicao + ' indisponível';
         }
-        if (!grade()) await clicar(aba, 'Aba do guarda-roupa indisponível.');
-        await aguardar(grade, 'O guarda-roupa não carregou.');
-        await clicar(() => {
-            const item = grade()?.querySelectorAll(cartao)[posicao - 1];
-            return item && encontrar('.btn-lightblue', item, 'Usar');
-        }, 'A posição ' + posicao + ' não tem um botão Usar disponível.');
-        await clicar(() => {
-            const painel = grade()?.closest('.nitro-card') || aba()?.closest('.nitro-card') || document;
-            return encontrar('.btn.btn-green', painel, 'Salvar mudanças');
-        }, 'Botão Salvar mudanças indisponível.');
-        concluir({ok: true});
-    } catch (erro) {
-        concluir({ok: false, erro: String(erro.message || erro)});
+        break;
     }
-})();
+    case 'Salvar mudanças': {
+        const painel = primeiro?.closest('.nitro-card') || aba?.closest('.nitro-card') || document;
+        alvo = achar('.btn.btn-green', painel, 'Salvar mudanças');
+        break;
+    }
+}
+if (!alvo) return {pronto: false, detalhe};
+alvo.click();
+return {pronto: true, clicado: true};
 """
 
 
 def trocar_roupa(driver, account_id, posicao, comando_id):
-    marcar_etapa(account_id, f"TROCAR ROUPA: usando a posição {posicao}.", status="👕 TROCAR ROUPA")
-    driver.set_script_timeout(55)
-    resposta = driver.execute_async_script(TROCAR_ROUPA_JS, posicao)
-    if not isinstance(resposta, dict) or not resposta.get("ok"):
-        detalhe = resposta.get("erro") if isinstance(resposta, dict) else repr(resposta)
-        raise RuntimeError(f"TROCAR ROUPA {comando_id}: {detalhe}")
-    log(f"[Conta {account_id}] TROCAR ROUPA {comando_id}: clicou em Salvar mudanças para a posição {posicao}.", Fore.GREEN)
-    marcar_etapa(account_id, "TROCAR ROUPA: comando concluído.", status="✅ Online", registrar=False)
+    for etapa in ("avatar", "roupas", "guarda-roupa", "Usar", "Salvar mudanças"):
+        marcar_etapa(account_id, f"TROCAR ROUPA {comando_id}: {etapa}, posição {posicao}.", status="👕 TROCAR ROUPA")
+        limite = time.monotonic() + 20
+        while True:
+            resultado = driver.execute_script(TROCAR_ROUPA_JS, etapa, posicao)
+            if resultado["pronto"]:
+                if resultado.get("clicado"):
+                    log(f"[Conta {account_id}] TROCAR ROUPA: clique em {etapa}.", Fore.CYAN)
+                    time.sleep(2)
+                break
+            if time.monotonic() >= limite:
+                detalhe = resultado.get("detalhe") or "controle indisponível"
+                raise RuntimeError(f"Etapa {etapa}, posição {posicao}: {detalhe}.")
+            time.sleep(0.5)
+    marcar_etapa(account_id, "TROCAR ROUPA: Salvar mudanças clicado.", status="✅ Online")
 
 
 def processar_comando_da_fila(driver, account_id):
