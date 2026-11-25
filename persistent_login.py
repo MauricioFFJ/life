@@ -899,12 +899,14 @@ def visitar_quarto(driver, account_id, dados, comando_id):
                       if el.is_displayed() and el.is_enabled()), None)
         return campo
 
+    marcar_etapa(account_id, "VISITAR QUARTO: localizando o navegador e o filtro Dono.", status="🚪 VISITAR QUARTO")
     if not filtro_visivel(driver):
         espera.until(EC.element_to_be_clickable(
             (By.CSS_SELECTOR, ".navigation-item.icon.icon-rooms")
         )).click()
     try:
         campo = espera.until(preparar_busca)
+        marcar_etapa(account_id, f"VISITAR QUARTO: filtro pronto; buscando {quarto!r} de {dono!r}.", status="🚪 VISITAR QUARTO")
     except TimeoutException as erro:
         raise RuntimeError("VISITAR QUARTO: não foi possível localizar o filtro Dono e o campo de busca.") from erro
     try:
@@ -1045,8 +1047,10 @@ function botaoBuscar() {
     return null;
 }
 function nomesQuartos() {
-    return [...painel.querySelectorAll('div.flex-grow-1.d-inline.text-black.text-truncate')]
-        .filter(visivel).map(el => ({el, nome: texto(el)})).filter(x => x.nome);
+    return [...painel.querySelectorAll('.navigator-grid .navigator-item.cursor-pointer')]
+        .filter(visivel)
+        .map(el => ({el, nome: texto(el.querySelector('.flex-grow-1.text-truncate'))}))
+        .filter(item => item.nome);
 }
 function similaridadeEdicao(a, b) {
     if (a === b) return 1;
@@ -1129,19 +1133,16 @@ function decidir(ordenados) {
         clicar(botao, 'pesquisar quartos por dono');
 
         fase = 'aguardando lista filtrada de quartos';
-        // O botão dispara uma consulta. Não escolher linhas antigas enquanto
-        // o React ainda está atualizando o resultado da pesquisa.
+        // Uma nova consulta pode devolver as mesmas linhas, sem recriar o DOM.
         let mudou = false;
-        const lista = await esperar(() => {
+        await esperar(() => {
             const atual = nomesQuartos();
             mudou ||= atual.length !== antes.length || atual.some((x, i) =>
                 x.el !== antes[i]?.el || x.nome !== antes[i]?.nome);
-            return mudou && atual.length ? atual : null;
-        }, 15000);
-        if (!lista) {
-            finalizar('quarto_ausente', {candidatos: [], trilha: [...trilha,
-                'A busca não apresentou uma lista nova de quartos.']});
-            return;
+            return mudou && atual.some(item => normalizar(item.nome) === normalizar(quartoDesejado));
+        }, 12000);
+        if (!campo.isConnected || campo.value !== dono) {
+            throw new Error('O campo do dono mudou durante a busca.');
         }
         const ranking = classificacao();
         const resumo = ranking.slice(0, 5).map(x => ({
