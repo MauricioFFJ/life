@@ -11,14 +11,14 @@ from datetime import datetime, timezone
 
 from selenium import webdriver
 from selenium.common.exceptions import (
-    NoSuchElementException, TimeoutException, StaleElementReferenceException,
+    NoSuchElementException, TimeoutException,
     ElementClickInterceptedException, ElementNotInteractableException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from colorama import Fore, Style, init
@@ -879,43 +879,16 @@ def visitar_quarto(driver, account_id, dados, comando_id):
         status="🚪 VISITAR QUARTO",
     )
     inicio = time.monotonic()
-    espera = WebDriverWait(driver, 12, ignored_exceptions=(StaleElementReferenceException,))
-    seletor_filtro = (By.XPATH, "//select[option[@value='2' and normalize-space(.)='Dono']]")
-    seletor_campo = (By.CSS_SELECTOR, 'input.form-control.form-control-sm[placeholder="filtrar quartos por"]')
-
-    def filtro_visivel(navegador):
-        return next((el for el in navegador.find_elements(*seletor_filtro)
-                     if el.is_displayed() and el.is_enabled()), None)
-
-    def preparar_busca(navegador):
-        filtro = filtro_visivel(navegador)
-        if filtro is None:
-            return False
-        if filtro.get_property("value") != "2":
-            Select(filtro).select_by_value("2")
-            return False  # Aguarda o formulário atualizado pelo cliente.
-        janela = navegador.execute_script("return arguments[0].closest('.nitro-card') || document.documentElement", filtro)
-        campo = next((el for el in janela.find_elements(*seletor_campo)
-                      if el.is_displayed() and el.is_enabled()), None)
-        return campo
-
-    marcar_etapa(account_id, "VISITAR QUARTO: localizando o navegador e o filtro Dono.", status="🚪 VISITAR QUARTO")
-    if not filtro_visivel(driver):
-        espera.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, ".navigation-item.icon.icon-rooms")
-        )).click()
-    try:
-        campo = espera.until(preparar_busca)
-        marcar_etapa(account_id, f"VISITAR QUARTO: filtro pronto; buscando {quarto!r} de {dono!r}.", status="🚪 VISITAR QUARTO")
-    except TimeoutException as erro:
-        raise RuntimeError("VISITAR QUARTO: não foi possível localizar o filtro Dono e o campo de busca.") from erro
+    marcar_etapa(account_id, "VISITAR QUARTO: verificando icon-rooms na página.", status="🚪 VISITAR QUARTO")
+    abertura = driver.execute_script(VISITAR_ABRIR_JS)
+    marcar_etapa(account_id, f"VISITAR QUARTO: {abertura}; aguardando filtro Dono.", status="🚪 VISITAR QUARTO")
     try:
         driver.set_script_timeout(VISITAR_QUARTO_SCRIPT_TIMEOUT)
         resposta = driver.execute_async_script(
             VISITAR_QUARTO_JS,
             dono,
             quarto,
-            campo,
+            abertura,
             (VISITAR_QUARTO_SCRIPT_TIMEOUT - 5) * 1000,
         )
     except Exception as erro:
@@ -978,14 +951,36 @@ def visitar_quarto(driver, account_id, dados, comando_id):
     return estado
 
 
-VISITAR_QUARTO_JS = r"""
+VISITAR_SELETORES_JS = r"""
+function visivelNoNavegador(el) {
+    return el.checkVisibility({visibilityProperty: true}) && el.getClientRects().length > 0;
+}
+function filtroDono() {
+    return [...document.querySelectorAll('select.form-select.form-select-sm')].find(el =>
+        visivelNoNavegador(el) && [...el.options].some(o => o.value === '2' && o.textContent.trim() === 'Dono'));
+}
+function iconeQuartos() {
+    return [...document.querySelectorAll('div.cursor-pointer.navigation-item.icon.icon-rooms')].find(visivelNoNavegador);
+}
+"""
+
+VISITAR_ABRIR_JS = VISITAR_SELETORES_JS + r"""
+if (filtroDono()) return 'navegador já aberto';
+const icone = iconeQuartos();
+if (!icone) return 'aguardando icon-rooms';
+icone.click();
+return 'icon-rooms clicado';
+"""
+
+VISITAR_QUARTO_JS = VISITAR_SELETORES_JS + r"""
 // Uma única chamada Selenium. Os eventos de input/change preservam o estado
 // de formulários controlados por React. A navegação real depende do Habblive.
 const dono = String(arguments[0] || '').trim();
 const quartoDesejado = String(arguments[1] || '').trim();
 const limiteMs = Number(arguments[3]) || 50000;
-let campo = arguments[2];
-let painel = campo.closest('.nitro-card') || document;
+const abertura = arguments[2];
+let campo = null;
+let painel = document;
 const finalizarSelenium = arguments[arguments.length - 1];
 const inicio = performance.now();
 const trilha = [];
@@ -1099,6 +1094,23 @@ function decidir(ordenados) {
 (async () => {
     try {
         if (!dono || !quartoDesejado) throw new Error('Dono/quarto vazios.');
+        fase = 'abrindo navegador de quartos';
+        if (abertura === 'aguardando icon-rooms') {
+            const controle = await esperar(() => filtroDono() || iconeQuartos(), 5000);
+            if (!controle) throw new Error('icon-rooms e filtro Dono ausentes na página.');
+            if (controle.tagName !== 'SELECT') clicar(controle, 'icon-rooms');
+        }
+        fase = 'selecionando filtro Dono';
+        const filtro = await esperar(() => {
+            const el = filtroDono();
+            if (!el || el.disabled) return null;
+            if (el.value === '2') return el;
+            el.value = '2';
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            return null;
+        }, 8000);
+        if (!filtro) throw new Error('O filtro Dono não apareceu ou não manteve a seleção.');
+        painel = filtro.closest('.nitro-card') || document;
         fase = 'confirmando nome completo do dono';
         const seletorCampo = 'input.form-control.form-control-sm[placeholder="filtrar quartos por"]';
         let estavelDesde = null;
