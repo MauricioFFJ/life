@@ -1768,6 +1768,73 @@ def navegar_para_destino(driver, account_id, comando_id, destino):
     )
 
 
+TROCAR_ROUPA_JS = r"""
+const posicao = arguments[0];
+const concluir = arguments[arguments.length - 1];
+const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
+const visivel = el => el && el.getClientRects().length && el.checkVisibility({visibilityProperty: true});
+function encontrar(seletor, raiz = document, nome = null) {
+    return [...raiz.querySelectorAll(seletor)].find(el =>
+        visivel(el) && !el.matches(':disabled, .disabled, [aria-disabled="true"]') &&
+        (nome === null || el.textContent.trim() === nome));
+}
+async function aguardar(buscar, descricao) {
+    const fim = performance.now() + 7000;
+    do {
+        const el = buscar();
+        if (el) return el;
+        await pausa(200);
+    } while (performance.now() < fim);
+    throw new Error(descricao);
+}
+async function clicar(buscar, descricao) {
+    const el = await aguardar(buscar, descricao);
+    el.click();
+    await pausa(1200);
+}
+const roupas = () => encontrar('.navigation-item.icon-me-clothing');
+const aba = () => encontrar('.main-wardrobe-icon')?.closest('.nav-item');
+const cartao = '.nitro-avatar-editor-wardrobe-figure-preview';
+function grade() {
+    return encontrar(cartao)?.parentElement;
+}
+(async () => {
+    try {
+        if (!aba()) {
+            if (!roupas()) {
+                await clicar(() => encontrar('.navigation-item.item-avatar'), 'Avatar indisponível.');
+            }
+            await clicar(roupas, 'Menu de roupas indisponível.');
+        }
+        if (!grade()) await clicar(aba, 'Aba do guarda-roupa indisponível.');
+        await aguardar(grade, 'O guarda-roupa não carregou.');
+        await clicar(() => {
+            const item = grade()?.querySelectorAll(cartao)[posicao - 1];
+            return item && encontrar('.btn-lightblue', item, 'Usar');
+        }, 'A posição ' + posicao + ' não tem um botão Usar disponível.');
+        await clicar(() => {
+            const painel = grade()?.closest('.nitro-card') || aba()?.closest('.nitro-card') || document;
+            return encontrar('.btn.btn-green', painel, 'Salvar mudanças');
+        }, 'Botão Salvar mudanças indisponível.');
+        concluir({ok: true});
+    } catch (erro) {
+        concluir({ok: false, erro: String(erro.message || erro)});
+    }
+})();
+"""
+
+
+def trocar_roupa(driver, account_id, posicao, comando_id):
+    marcar_etapa(account_id, f"TROCAR ROUPA: usando a posição {posicao}.", status="👕 TROCAR ROUPA")
+    driver.set_script_timeout(55)
+    resposta = driver.execute_async_script(TROCAR_ROUPA_JS, posicao)
+    if not isinstance(resposta, dict) or not resposta.get("ok"):
+        detalhe = resposta.get("erro") if isinstance(resposta, dict) else repr(resposta)
+        raise RuntimeError(f"TROCAR ROUPA {comando_id}: {detalhe}")
+    log(f"[Conta {account_id}] TROCAR ROUPA {comando_id}: clicou em Salvar mudanças para a posição {posicao}.", Fore.GREEN)
+    marcar_etapa(account_id, "TROCAR ROUPA: comando concluído.", status="✅ Online", registrar=False)
+
+
 def processar_comando_da_fila(driver, account_id):
     """Executa uma ação da fila na thread proprietária do ChromeDriver."""
     fila = filas_comandos.get(account_id)
@@ -1784,8 +1851,8 @@ def processar_comando_da_fila(driver, account_id):
         fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
-    nome_acao = {"say": "FALAR", "go_home": mensagem, "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
-    status_acao = {"say": "💬 FALAR", "go_home": mensagem, "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO", "treat_pets": "🌿 TRATAR E CARINHOS"}.get(acao, "🔄 Executando")
+    nome_acao = {"say": "FALAR", "go_home": mensagem, "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "change_outfit": "TROCAR ROUPA", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
+    status_acao = {"say": "💬 FALAR", "go_home": mensagem, "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO", "change_outfit": "👕 TROCAR ROUPA", "treat_pets": "🌿 TRATAR E CARINHOS"}.get(acao, "🔄 Executando")
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
@@ -1809,6 +1876,8 @@ def processar_comando_da_fila(driver, account_id):
             respeitar_usuario(driver, account_id, mensagem, comando_id)
         elif acao == "visit_room":
             visitar_quarto(driver, account_id, mensagem, comando_id)
+        elif acao == "change_outfit":
+            trocar_roupa(driver, account_id, mensagem, comando_id)
         elif acao == "treat_pets":
             tratar_e_carinhos(driver, account_id, comando_id)
         else:
@@ -1947,11 +2016,16 @@ def monitorar_comandos(account_ids):
                     conhecidos.add(nome)
 
                     acao = str(comando.get("action", ""))
-                    if acao not in ("say", "go_home", "respect", "visit_room", "treat_pets"):
+                    if acao not in ("say", "go_home", "respect", "visit_room", "treat_pets", "change_outfit"):
                         continue
 
                     if acao == "say":
                         mensagem = str(comando.get("message", ""))
+                    elif acao == "change_outfit":
+                        mensagem = comando.get("outfit_slot")
+                        if type(mensagem) is not int or not 1 <= mensagem <= 30:
+                            log(f"Posição de roupa inválida em {nome}: {mensagem!r}", Fore.YELLOW)
+                            continue
                     elif acao == "go_home":
                         mensagem = comando.get("destino", "Cafofo")
                         if mensagem not in ("Cafofo", "Vista do hotel"):
@@ -2020,7 +2094,7 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando { {'say': 'FALAR', 'go_home': mensagem, 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO', 'treat_pets': 'TRATAR E CARINHOS'}[acao] } recebido "
+                        f"Novo comando { {'say': 'FALAR', 'go_home': mensagem, 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO', 'change_outfit': 'TROCAR ROUPA', 'treat_pets': 'TRATAR E CARINHOS'}[acao] } recebido "
                         f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )
